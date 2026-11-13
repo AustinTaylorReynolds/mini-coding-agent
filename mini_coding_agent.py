@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
+DOC_NAMES = ("AGENTS.md", "CONTRIBUTING.md", "README.md", "pyproject.toml", "package.json")
 HELP_TEXT = "/help, /memory, /session, /reset, /exit"
 WELCOME_ART = (
     "/\\     /\\\\",
@@ -110,7 +110,7 @@ class WorkspaceContext:
                 key = str(path.relative_to(repo_root))
                 if key in docs:
                     continue
-                docs[key] = clip(path.read_text(encoding="utf-8", errors="replace"), 1200)
+                docs[key] = clip(path.read_text(encoding="utf-8", errors="replace"), 2500 if name == "CONTRIBUTING.md" else 1200)
 
         return cls(
             cwd=str(cwd),
@@ -318,6 +318,31 @@ class MiniAgent:
                 "run": self.tool_patch_file,
             },
         }
+        # Lab 6: tools for the fork -> branch -> commit -> pull request workflow.
+        tools["fork_repo"] = {
+            "schema": {},
+            "risky": True,
+            "description": "Fork the upstream GitHub repo this workspace was cloned from into your own account and point origin at the fork.",
+            "run": self.tool_fork_repo,
+        }
+        tools["create_branch"] = {
+            "schema": {"name": "str"},
+            "risky": True,
+            "description": "Create and switch to a new git branch for the change.",
+            "run": self.tool_create_branch,
+        }
+        tools["commit_changes"] = {
+            "schema": {"message": "str", "paths": "list[str]"},
+            "risky": True,
+            "description": "Stage exactly the listed files and commit them.",
+            "run": self.tool_commit_changes,
+        }
+        tools["submit_pr"] = {
+            "schema": {"title": "str", "body": "str", "base": "str=''"},
+            "risky": True,
+            "description": "Push the current branch to your fork and open a pull request against your fork (never upstream).",
+            "run": self.tool_submit_pr,
+        }
         if self.depth < self.max_depth:
             tools["delegate"] = {
                 "schema": {"task": "str", "max_steps": "int=3"},
@@ -363,6 +388,9 @@ class MiniAgent:
             "- When writing tests, match the current implementation unless the user explicitly asked you to change the code.",
             "- New files should be complete and runnable, including obvious imports.",
             "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.",
+            "- If CONTRIBUTING.md is listed in project_docs, follow it. It may be clipped, so use read_file to see all of it.",
+            "- To contribute a fix: fork_repo, create_branch, edit files, run the project's tests, commit_changes, then submit_pr.",
+            "- Never push to or open a pull request against the upstream project. Only your own fork is allowed.",
             "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={}.",
         ])
         return "\n\n".join([
@@ -530,6 +558,10 @@ class MiniAgent:
             "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
             "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
             "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
+            "fork_repo": '<tool>{"name":"fork_repo","args":{}}</tool>',
+            "create_branch": '<tool>{"name":"create_branch","args":{"name":"fix/pow-overflow"}}</tool>',
+            "commit_changes": '<tool>{"name":"commit_changes","args":{"message":"fix: handle overflow","paths":["src/main/java/Pow.java"]}}</tool>',
+            "submit_pr": '<tool>{"name":"submit_pr","args":{"title":"Fix overflow","body":"What and why."}}</tool>',
         }
         return examples.get(name, "")
 
@@ -597,6 +629,29 @@ class MiniAgent:
             task = str(args.get("task", "")).strip()
             if not task:
                 raise ValueError("task must not be empty")
+            return
+
+        if name == "create_branch":
+            branch = str(args.get("name", "")).strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or ".." in branch:
+                raise ValueError("name must be a simple git branch name such as fix/pow-overflow")
+            return
+
+        if name == "commit_changes":
+            if not str(args.get("message", "")).strip():
+                raise ValueError("message must not be empty")
+            paths = self.path_list(args.get("paths", []))
+            if not paths:
+                raise ValueError("paths must list the files to commit")
+            for raw in paths:
+                relative = self.path(raw).relative_to(self.root)
+                if IGNORED_PATH_NAMES & set(relative.parts):
+                    raise ValueError(f"refusing to commit agent or git internals: {raw}")
+            return
+
+        if name == "submit_pr":
+            if not str(args.get("title", "")).strip():
+                raise ValueError("title must not be empty")
             return
 
     def approve(self, name, args):
@@ -840,6 +895,70 @@ class MiniAgent:
             raise ValueError(f"old_text must occur exactly once, found {count}")
         path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
         return f"patched {path.relative_to(self.root)}"
+
+    ###################################################
+    #### Lab 6: Fork, Branch, Commit, Pull Request ####
+    ###################################################
+    def run_cmd(self, argv, timeout=60):
+        # A list of arguments (no shell=True), so model-written text can never become shell syntax.
+        result = subprocess.run(argv, cwd=self.root, capture_output=True, text=True, timeout=timeout)
+        output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part) or "(empty)"
+        if result.returncode != 0:
+            raise RuntimeError(f"{' '.join(argv)} failed (exit {result.returncode}): {output}")
+        return output
+
+    @staticmethod
+    def repo_slug(url):
+        # "https://github.com/owner/name.git" or "git@github.com:owner/name.git" -> "owner/name"
+        match = re.search(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", url.strip())
+        return f"{match.group(1)}/{match.group(2)}" if match else ""
+
+    @staticmethod
+    def path_list(raw):
+        return raw.replace(",", " ").split() if isinstance(raw, str) else [str(item) for item in raw]
+
+    def my_fork(self):
+        """Safety guard: return 'you/repo' for origin, but only if origin belongs to the logged-in GitHub user."""
+        origin = self.repo_slug(self.run_cmd(["git", "remote", "get-url", "origin"]))
+        me = self.run_cmd(["gh", "api", "user", "--jq", ".login"]).strip()
+        if not origin or origin.split("/")[0].lower() != me.lower():
+            raise ValueError(
+                f"origin ({origin or 'unknown'}) is not owned by {me}; refusing to push or open a PR "
+                "because only your own fork is allowed (never contribute upstream)"
+            )
+        return origin
+
+    def tool_fork_repo(self, args):
+        try:
+            return f"already a fork: origin is {self.my_fork()}; nothing to do"
+        except ValueError:
+            pass  # origin is not ours yet, so fork it below
+        forked = self.run_cmd(["gh", "repo", "fork", "--remote"], timeout=120)
+        return forked + "\nremotes:\n" + self.run_cmd(["git", "remote", "-v"])
+
+    def tool_create_branch(self, args):
+        return self.run_cmd(["git", "switch", "-c", str(args["name"]).strip()])
+
+    def tool_commit_changes(self, args):
+        # Only the listed files are staged. "git add -A" would also sweep in .mini-coding-agent/.
+        paths = [self.path(raw).relative_to(self.root).as_posix() for raw in self.path_list(args["paths"])]
+        self.run_cmd(["git", "add", "--", *paths])
+        self.run_cmd(["git", "commit", "-m", str(args["message"]).strip()])
+        return self.run_cmd(["git", "log", "--oneline", "-1"])
+
+    def tool_submit_pr(self, args):
+        fork = self.my_fork()
+        branch = self.run_cmd(["git", "branch", "--show-current"])
+        base = str(args.get("base") or self.workspace.default_branch)
+        if branch == base:
+            raise ValueError(f"currently on {base}; use create_branch first")
+        self.run_cmd(["git", "push", "-u", "origin", branch], timeout=120)
+        url = self.run_cmd(
+            ["gh", "pr", "create", "--repo", fork, "--base", base, "--head", branch,
+             "--title", str(args["title"]).strip(), "--body", str(args.get("body", ""))],
+            timeout=120,
+        )
+        return f"opened a PR on your fork ({fork}):\n{url}"
 
     ###################################################
     #### 6) Delegation And Bounded Subagents ##########
